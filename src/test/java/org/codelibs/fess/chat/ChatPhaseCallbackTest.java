@@ -16,7 +16,9 @@
 package org.codelibs.fess.chat;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 
 import org.codelibs.fess.unit.UnitFessTestCase;
 import org.junit.jupiter.api.Test;
@@ -212,5 +214,45 @@ public class ChatPhaseCallbackTest extends UnitFessTestCase {
         assertEquals("evaluate", phases.get(2));
         assertEquals("fetch", phases.get(3));
         assertEquals("answer", phases.get(4));
+    }
+
+    @Test
+    public void test_noOp_supportsAllNewMethods() {
+        final ChatPhaseCallback cb = ChatPhaseCallback.noOp();
+        cb.onPhaseStart("intent", "msg");
+        cb.onPhaseStart("search", "msg", "kw");
+        cb.onPhaseComplete("intent");
+        cb.onPhaseComplete("search", Map.of("hitCount", 12));
+        cb.onChunk("c", false);
+        cb.onError("intent", "err");
+        cb.onRetry("intent", "streamChat", 1, 3, 1000L, "status:429");
+        cb.onWaiting("intent", "concurrency_limit", 0L, 30000L);
+        cb.onFallback("search", "no_relevant_results", "orig", "new");
+        cb.onWarning("intent", "reasoning_token_exhausted", "search");
+    }
+
+    @Test
+    public void test_onPhaseComplete_withPayload_defaultDelegates() {
+        final boolean[] called = { false };
+        final ChatPhaseCallback cb = new ChatPhaseCallback() {
+            @Override
+            public void onPhaseStart(final String phase, final String message) {
+            }
+
+            @Override
+            public void onPhaseComplete(final String phase) {
+                called[0] = true;
+            }
+
+            @Override
+            public void onChunk(final String content, final boolean done) {
+            }
+
+            @Override
+            public void onError(final String phase, final String error) {
+            }
+        };
+        cb.onPhaseComplete("search", Collections.emptyMap());
+        assertTrue(called[0]);
     }
 }

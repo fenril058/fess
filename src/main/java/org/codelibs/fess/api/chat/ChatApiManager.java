@@ -62,6 +62,9 @@ public class ChatApiManager extends BaseApiManager {
 
     private static final ObjectMapper objectMapper = new ObjectMapper();
 
+    /** Payload keys reserved by the SSE protocol; must not be overridden by phase callback metadata. */
+    private static final Set<String> RESERVED_PAYLOAD_KEYS = Set.of("phase", "status");
+
     /** The path prefix for the chat API endpoints. */
     protected String pathPrefix = CHAT_API_PATH;
 
@@ -276,64 +279,86 @@ public class ChatApiManager extends BaseApiManager {
 
                 @Override
                 public void onPhaseStart(final String phase, final String phaseMessage, final String keywords) {
-                    try {
-                        final Map<String, Object> data = new HashMap<>();
-                        data.put("phase", phase);
-                        data.put("status", "start");
-                        data.put("message", phaseMessage);
-                        if (keywords != null) {
-                            data.put("keywords", keywords);
-                        }
-                        sendSseEvent(writer, "phase", data);
-                        if (logger.isDebugEnabled()) {
-                            logger.debug("SSE phase start event sent. phase={}, message={}, keywords={}", phase, phaseMessage, keywords);
-                        }
-                    } catch (final Exception e) {
-                        if (logger.isDebugEnabled()) {
-                            logger.debug("Failed to send phase start event. phase={}, error={}", phase, e.getMessage());
-                        }
-                    }
+                    final Map<String, Object> data = new HashMap<>();
+                    data.put("phase", phase);
+                    data.put("status", "start");
+                    data.put("message", phaseMessage);
+                    putIfNotNull(data, "keywords", keywords);
+                    emitSseEventSafely(writer, "phase", data);
                 }
 
                 @Override
                 public void onPhaseComplete(final String phase) {
-                    try {
-                        sendSseEvent(writer, "phase", Map.of("phase", phase, "status", "complete"));
-                        if (logger.isDebugEnabled()) {
-                            logger.debug("SSE phase complete event sent. phase={}", phase);
-                        }
-                    } catch (final Exception e) {
-                        if (logger.isDebugEnabled()) {
-                            logger.debug("Failed to send phase complete event. phase={}, error={}", phase, e.getMessage());
-                        }
+                    onPhaseComplete(phase, java.util.Collections.emptyMap());
+                }
+
+                @Override
+                public void onPhaseComplete(final String phase, final Map<String, Object> payload) {
+                    final Map<String, Object> data = new HashMap<>();
+                    data.put("phase", phase);
+                    data.put("status", "complete");
+                    if (payload != null) {
+                        payload.forEach((k, v) -> {
+                            if (v != null && !RESERVED_PAYLOAD_KEYS.contains(k)) {
+                                data.put(k, v);
+                            }
+                        });
                     }
+                    emitSseEventSafely(writer, "phase", data);
                 }
 
                 @Override
                 public void onChunk(final String content, final boolean done) {
-                    try {
-                        if (content != null && !content.isEmpty()) {
-                            sendSseEvent(writer, "chunk", Map.of("content", content));
-                        }
-                    } catch (final Exception e) {
-                        if (logger.isDebugEnabled()) {
-                            logger.debug("Failed to send SSE chunk. error={}", e.getMessage());
-                        }
+                    if (content != null && !content.isEmpty()) {
+                        emitSseEventSafely(writer, "chunk", Map.of("content", content));
                     }
                 }
 
                 @Override
                 public void onError(final String phase, final String errorCode) {
-                    try {
-                        sendSseEvent(writer, "error", Map.of("phase", phase, "message", errorCode, "errorCode", errorCode));
-                        if (logger.isDebugEnabled()) {
-                            logger.debug("SSE error event sent. phase={}, error={}", phase, errorCode);
-                        }
-                    } catch (final Exception e) {
-                        if (logger.isDebugEnabled()) {
-                            logger.debug("Failed to send error event. phase={}, error={}", phase, e.getMessage());
-                        }
-                    }
+                    emitSseEventSafely(writer, "error", Map.of("phase", phase, "message", errorCode, "errorCode", errorCode));
+                }
+
+                @Override
+                public void onRetry(final String phase, final String operation, final int attempt, final int maxAttempts,
+                        final long sleepMs, final String cause) {
+                    final Map<String, Object> data = new HashMap<>();
+                    data.put("phase", phase);
+                    data.put("operation", operation);
+                    data.put("attempt", attempt);
+                    data.put("maxAttempts", maxAttempts);
+                    data.put("sleepMs", sleepMs);
+                    putIfNotNull(data, "cause", cause);
+                    emitSseEventSafely(writer, "retry", data);
+                }
+
+                @Override
+                public void onWaiting(final String phase, final String reason, final long elapsedMs, final long timeoutMs) {
+                    final Map<String, Object> data = new HashMap<>();
+                    data.put("phase", phase);
+                    data.put("reason", reason);
+                    data.put("elapsedMs", elapsedMs);
+                    data.put("timeoutMs", timeoutMs);
+                    emitSseEventSafely(writer, "waiting", data);
+                }
+
+                @Override
+                public void onFallback(final String phase, final String reason, final String originalQuery, final String newQuery) {
+                    final Map<String, Object> data = new HashMap<>();
+                    data.put("phase", phase);
+                    data.put("reason", reason);
+                    putIfNotNull(data, "originalQuery", originalQuery);
+                    putIfNotNull(data, "newQuery", newQuery);
+                    emitSseEventSafely(writer, "fallback", data);
+                }
+
+                @Override
+                public void onWarning(final String phase, final String code, final String detail) {
+                    final Map<String, Object> data = new HashMap<>();
+                    data.put("phase", phase);
+                    data.put("code", code);
+                    putIfNotNull(data, "detail", detail);
+                    emitSseEventSafely(writer, "warning", data);
                 }
             };
 
@@ -383,6 +408,40 @@ public class ChatApiManager extends BaseApiManager {
                     logger.warn("Failed to send error response. error={}", ioe.getMessage());
                 }
             }
+        }
+    }
+
+    /**
+     * Sends an SSE event with broad exception handling and debug logging on success or failure.
+     * Use for phase-callback emitters that should never break the streaming flow on a callback fault.
+     *
+     * @param writer the print writer to write the event to
+     * @param event the event name
+     * @param data the event data to serialize as JSON
+     */
+    protected void emitSseEventSafely(final PrintWriter writer, final String event, final Map<String, Object> data) {
+        try {
+            sendSseEvent(writer, event, data);
+            if (logger.isDebugEnabled()) {
+                logger.debug("SSE {} event sent. data={}", event, data);
+            }
+        } catch (final Exception e) {
+            if (logger.isDebugEnabled()) {
+                logger.debug("Failed to send {} event. error={}", event, e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Puts {@code value} into {@code data} under {@code key} only if {@code value} is non-null.
+     *
+     * @param data the destination map
+     * @param key the key to write
+     * @param value the value to write (skipped if null)
+     */
+    protected static void putIfNotNull(final Map<String, Object> data, final String key, final Object value) {
+        if (value != null) {
+            data.put(key, value);
         }
     }
 

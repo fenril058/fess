@@ -256,6 +256,9 @@ public class ChatClient {
             long phaseStartTime = System.currentTimeMillis();
             callback.onPhaseStart(ChatPhaseCallback.PHASE_INTENT, "Analyzing your question...");
             final IntentDetectionResult intentResult = llmClientManager.detectIntent(userMessage, history);
+            if (intentResult.isFallback()) {
+                callback.onWarning(ChatPhaseCallback.PHASE_INTENT, "reasoning_token_exhausted", "search");
+            }
             callback.onPhaseComplete(ChatPhaseCallback.PHASE_INTENT);
 
             if (logger.isDebugEnabled()) {
@@ -268,10 +271,13 @@ public class ChatClient {
                 // Intent is unclear - ask user for clarification
                 phaseStartTime = System.currentTimeMillis();
                 callback.onPhaseStart(ChatPhaseCallback.PHASE_ANSWER, "Generating response...");
-                llmClientManager.generateUnclearIntentResponse(userMessage, history, (chunk, done) -> {
+                final LlmStreamCallback rawUnclearCallback = (chunk, done) -> {
                     fullResponse.append(chunk);
                     callback.onChunk(chunk, done);
-                });
+                };
+                final LlmStreamCallback unclearCallback =
+                        new PhaseAwareStreamCallback(ChatPhaseCallback.PHASE_ANSWER, callback, rawUnclearCallback);
+                llmClientManager.generateUnclearIntentResponse(userMessage, history, unclearCallback);
                 callback.onPhaseComplete(ChatPhaseCallback.PHASE_ANSWER);
                 if (logger.isDebugEnabled()) {
                     logger.debug("[RAG] Phase {} completed. responseLength={}, phaseElapsedTime={}ms", ChatPhaseCallback.PHASE_ANSWER,
@@ -286,7 +292,7 @@ public class ChatClient {
                 final List<Map<String, Object>> urlResults = urlSearchResult.getDocuments();
                 searchQueryId = urlSearchResult.getQueryId();
                 searchRequestedTime = urlSearchResult.getRequestedTime();
-                callback.onPhaseComplete(ChatPhaseCallback.PHASE_SEARCH);
+                callback.onPhaseComplete(ChatPhaseCallback.PHASE_SEARCH, Map.of("hitCount", urlResults.size()));
                 if (logger.isDebugEnabled()) {
                     logger.debug("[RAG] Phase {} completed. documentUrl={}, resultCount={}, phaseElapsedTime={}ms",
                             ChatPhaseCallback.PHASE_SEARCH, documentUrl, urlResults.size(), System.currentTimeMillis() - phaseStartTime);
@@ -296,10 +302,13 @@ public class ChatClient {
                     // URL not found - inform user
                     phaseStartTime = System.currentTimeMillis();
                     callback.onPhaseStart(ChatPhaseCallback.PHASE_ANSWER, "Generating response...");
-                    llmClientManager.generateDocumentNotFoundResponse(userMessage, documentUrl, history, (chunk, done) -> {
+                    final LlmStreamCallback rawDocNotFoundCallback = (chunk, done) -> {
                         fullResponse.append(chunk);
                         callback.onChunk(chunk, done);
-                    });
+                    };
+                    final LlmStreamCallback docNotFoundCallback =
+                            new PhaseAwareStreamCallback(ChatPhaseCallback.PHASE_ANSWER, callback, rawDocNotFoundCallback);
+                    llmClientManager.generateDocumentNotFoundResponse(userMessage, documentUrl, history, docNotFoundCallback);
                     callback.onPhaseComplete(ChatPhaseCallback.PHASE_ANSWER);
                     if (logger.isDebugEnabled()) {
                         logger.debug("[RAG] Phase {} completed. responseLength={}, phaseElapsedTime={}ms", ChatPhaseCallback.PHASE_ANSWER,
@@ -323,10 +332,13 @@ public class ChatClient {
 
                     phaseStartTime = System.currentTimeMillis();
                     callback.onPhaseStart(ChatPhaseCallback.PHASE_ANSWER, "Generating summary...");
-                    llmClientManager.generateSummaryResponse(userMessage, fullDocs, history, (chunk, done) -> {
+                    final LlmStreamCallback rawSummaryCallback = (chunk, done) -> {
                         fullResponse.append(chunk);
                         callback.onChunk(chunk, done);
-                    });
+                    };
+                    final LlmStreamCallback summaryCallback =
+                            new PhaseAwareStreamCallback(ChatPhaseCallback.PHASE_ANSWER, callback, rawSummaryCallback);
+                    llmClientManager.generateSummaryResponse(userMessage, fullDocs, history, summaryCallback);
                     callback.onPhaseComplete(ChatPhaseCallback.PHASE_ANSWER);
                     if (logger.isDebugEnabled()) {
                         logger.debug("[RAG] Phase {} completed. responseLength={}, phaseElapsedTime={}ms", ChatPhaseCallback.PHASE_ANSWER,
@@ -342,7 +354,7 @@ public class ChatClient {
                 List<Map<String, Object>> searchResults = querySearchResult.getDocuments();
                 searchQueryId = querySearchResult.getQueryId();
                 searchRequestedTime = querySearchResult.getRequestedTime();
-                callback.onPhaseComplete(ChatPhaseCallback.PHASE_SEARCH);
+                callback.onPhaseComplete(ChatPhaseCallback.PHASE_SEARCH, Map.of("hitCount", searchResults.size()));
 
                 logger.info("[RAG] Search completed. query={}, resultCount={}, elapsedTime={}ms", query, searchResults.size(),
                         System.currentTimeMillis() - phaseStartTime);
@@ -357,12 +369,13 @@ public class ChatClient {
                     final String newQuery = llmClientManager.regenerateQuery(userMessage, query, "no_results", history);
                     if (StringUtil.isNotBlank(newQuery) && !newQuery.equals(query)) {
                         logger.info("[RAG] Regenerated query. newQuery={}", newQuery);
+                        callback.onFallback(ChatPhaseCallback.PHASE_SEARCH, "no_results", query, newQuery);
                         callback.onPhaseStart(ChatPhaseCallback.PHASE_SEARCH, "Searching with refined query...", newQuery);
                         final ChatSearchResult fallbackResult = searchWithQueryAndMetadata(newQuery, safeFields, safeExtraQueries);
                         searchResults = fallbackResult.getDocuments();
                         searchQueryId = fallbackResult.getQueryId();
                         searchRequestedTime = fallbackResult.getRequestedTime();
-                        callback.onPhaseComplete(ChatPhaseCallback.PHASE_SEARCH);
+                        callback.onPhaseComplete(ChatPhaseCallback.PHASE_SEARCH, Map.of("hitCount", searchResults.size()));
                     }
                 }
 
@@ -370,10 +383,13 @@ public class ChatClient {
                     // No results even after fallback - generate no-results response
                     phaseStartTime = System.currentTimeMillis();
                     callback.onPhaseStart(ChatPhaseCallback.PHASE_ANSWER, "Generating response...");
-                    llmClientManager.generateNoResultsResponse(userMessage, history, (chunk, done) -> {
+                    final LlmStreamCallback rawNoResultsCallback = (chunk, done) -> {
                         fullResponse.append(chunk);
                         callback.onChunk(chunk, done);
-                    });
+                    };
+                    final LlmStreamCallback noResultsCallback =
+                            new PhaseAwareStreamCallback(ChatPhaseCallback.PHASE_ANSWER, callback, rawNoResultsCallback);
+                    llmClientManager.generateNoResultsResponse(userMessage, history, noResultsCallback);
                     callback.onPhaseComplete(ChatPhaseCallback.PHASE_ANSWER);
                     if (logger.isDebugEnabled()) {
                         logger.debug("[RAG] Phase {} completed. responseLength={}, phaseElapsedTime={}ms", ChatPhaseCallback.PHASE_ANSWER,
@@ -399,10 +415,11 @@ public class ChatClient {
 
                         boolean fallbackSucceeded = false;
                         if (StringUtil.isNotBlank(newQuery) && !newQuery.equals(query)) {
+                            callback.onFallback(ChatPhaseCallback.PHASE_SEARCH, "no_relevant_results", query, newQuery);
                             callback.onPhaseStart(ChatPhaseCallback.PHASE_SEARCH, "Searching with refined query...", newQuery);
                             final ChatSearchResult fallbackResult = searchWithQueryAndMetadata(newQuery, safeFields, safeExtraQueries);
                             final List<Map<String, Object>> fallbackSearchResults = fallbackResult.getDocuments();
-                            callback.onPhaseComplete(ChatPhaseCallback.PHASE_SEARCH);
+                            callback.onPhaseComplete(ChatPhaseCallback.PHASE_SEARCH, Map.of("hitCount", fallbackSearchResults.size()));
 
                             if (!fallbackSearchResults.isEmpty()) {
                                 // Re-evaluate fallback results
@@ -425,10 +442,13 @@ public class ChatClient {
                             // All fallbacks failed - generate no-results response
                             phaseStartTime = System.currentTimeMillis();
                             callback.onPhaseStart(ChatPhaseCallback.PHASE_ANSWER, "Generating response...");
-                            llmClientManager.generateNoResultsResponse(userMessage, history, (chunk, done) -> {
+                            final LlmStreamCallback rawFallbackNoResultsCallback = (chunk, done) -> {
                                 fullResponse.append(chunk);
                                 callback.onChunk(chunk, done);
-                            });
+                            };
+                            final LlmStreamCallback fallbackNoResultsCallback =
+                                    new PhaseAwareStreamCallback(ChatPhaseCallback.PHASE_ANSWER, callback, rawFallbackNoResultsCallback);
+                            llmClientManager.generateNoResultsResponse(userMessage, history, fallbackNoResultsCallback);
                             callback.onPhaseComplete(ChatPhaseCallback.PHASE_ANSWER);
                             if (logger.isDebugEnabled()) {
                                 logger.debug("[RAG] Phase {} completed. responseLength={}, phaseElapsedTime={}ms",
@@ -454,10 +474,12 @@ public class ChatClient {
                         // Phase 5: Generate answer
                         phaseStartTime = System.currentTimeMillis();
                         callback.onPhaseStart(ChatPhaseCallback.PHASE_ANSWER, "Generating response...");
-                        final LlmStreamCallback answerCallback = (chunk, done) -> {
+                        final LlmStreamCallback rawAnswerCallback = (chunk, done) -> {
                             fullResponse.append(chunk);
                             callback.onChunk(chunk, done);
                         };
+                        final LlmStreamCallback answerCallback =
+                                new PhaseAwareStreamCallback(ChatPhaseCallback.PHASE_ANSWER, callback, rawAnswerCallback);
                         if (intentResult.getIntent() == ChatIntent.FAQ) {
                             llmClientManager.generateFaqAnswerResponse(userMessage, fullDocs, history, answerCallback);
                         } else {
