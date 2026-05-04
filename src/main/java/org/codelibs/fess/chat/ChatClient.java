@@ -133,22 +133,24 @@ public class ChatClient {
         }
 
         final ChatSession session = chatSessionManager.getOrCreateSession(sessionId, userId);
-        // Extract history snapshot before adding current user message to avoid duplication
-        final List<LlmMessage> history = extractHistory(session);
+        // Extract phase-specific history snapshots before adding current user message.
+        final List<LlmMessage> historyForIntent = extractHistoryForIntent(session);
+        final List<LlmMessage> historyForAnswer = extractHistoryForAnswer(session);
         // Add user message immediately for session integrity under concurrent access
         final ChatMessage userChatMessage = ChatMessage.userMessage(userMessage);
         session.addMessage(userChatMessage);
 
         try {
+            String finalSearchQuery = null;
             // Intent detection
-            final IntentDetectionResult intentResult = llmClientManager.detectIntent(userMessage, history);
+            final IntentDetectionResult intentResult = llmClientManager.detectIntent(userMessage, historyForIntent);
             if (logger.isDebugEnabled()) {
                 logger.debug("[RAG] Intent detected. intent={}, query={}", intentResult.getIntent(), intentResult.getQuery());
             }
 
             if (intentResult.getIntent() == ChatIntent.UNCLEAR) {
                 // Unclear intent - generate answer with empty documents to ask for clarification
-                final LlmChatResponse llmResponse = llmClientManager.generateAnswer(userMessage, Collections.emptyList(), history);
+                final LlmChatResponse llmResponse = llmClientManager.generateAnswer(userMessage, Collections.emptyList(), historyForAnswer);
                 final ChatMessage assistantMessage = ChatMessage.assistantMessage(llmResponse.getContent());
                 session.addMessage(assistantMessage);
                 logger.info("[RAG] Chat completed (unclear). sessionId={}, elapsedTime={}ms", session.getSessionId(),
@@ -163,23 +165,26 @@ public class ChatClient {
             } else {
                 final String query = StringUtil.isBlank(intentResult.getQuery()) ? userMessage : intentResult.getQuery();
                 searchResult = searchWithQueryAndMetadata(query, safeFields, safeExtraQueries);
+                finalSearchQuery = query;
 
                 // Fallback: regenerate query if no results
                 if (searchResult.getDocuments().isEmpty()) {
                     logger.info("[RAG] Primary search returned 0 results, regenerating query. originalQuery={}", query);
-                    final String newQuery = llmClientManager.regenerateQuery(userMessage, query, "no_results", history);
+                    final String newQuery = llmClientManager.regenerateQuery(userMessage, query, "no_results", historyForIntent);
                     if (StringUtil.isNotBlank(newQuery) && !newQuery.equals(query)) {
                         logger.info("[RAG] Regenerated query. newQuery={}", newQuery);
                         searchResult = searchWithQueryAndMetadata(newQuery, safeFields, safeExtraQueries);
+                        finalSearchQuery = newQuery;
                     }
                 }
             }
 
             final List<Map<String, Object>> searchResults = searchResult.getDocuments();
-            final LlmChatResponse llmResponse = llmClientManager.generateAnswer(userMessage, searchResults, history);
+            final LlmChatResponse llmResponse = llmClientManager.generateAnswer(userMessage, searchResults, historyForAnswer);
 
             final ChatMessage assistantMessage = ChatMessage.assistantMessage(llmResponse.getContent());
             addSourcesToMessage(assistantMessage, searchResults, contextPath, searchResult.getQueryId(), searchResult.getRequestedTime());
+            assistantMessage.setSearchQuery(finalSearchQuery);
 
             session.addMessage(assistantMessage);
 
@@ -241,8 +246,10 @@ public class ChatClient {
         }
 
         final ChatSession session = chatSessionManager.getOrCreateSession(sessionId, userId);
-        // Extract history snapshot before adding current user message to avoid duplication
-        final List<LlmMessage> history = extractHistory(session);
+        // Extract phase-specific history snapshots before adding current user message.
+        // Intent phase uses minimal context; answer phase pairs user/assistant turns.
+        final List<LlmMessage> historyForIntent = extractHistoryForIntent(session);
+        final List<LlmMessage> historyForAnswer = extractHistoryForAnswer(session);
         // Add user message immediately for session integrity under concurrent access
         final ChatMessage userChatMessage = ChatMessage.userMessage(userMessage);
         session.addMessage(userChatMessage);
@@ -250,12 +257,13 @@ public class ChatClient {
         List<Map<String, Object>> sources = new ArrayList<>();
         String searchQueryId = null;
         long searchRequestedTime = 0L;
+        String finalSearchQuery = null;
 
         try {
             // Phase 1: Intent Detection
             long phaseStartTime = System.currentTimeMillis();
             callback.onPhaseStart(ChatPhaseCallback.PHASE_INTENT, "Analyzing your question...");
-            final IntentDetectionResult intentResult = llmClientManager.detectIntent(userMessage, history);
+            final IntentDetectionResult intentResult = llmClientManager.detectIntent(userMessage, historyForIntent);
             if (intentResult.isFallback()) {
                 callback.onWarning(ChatPhaseCallback.PHASE_INTENT, "reasoning_token_exhausted", "search");
             }
@@ -277,7 +285,7 @@ public class ChatClient {
                 };
                 final LlmStreamCallback unclearCallback =
                         new PhaseAwareStreamCallback(ChatPhaseCallback.PHASE_ANSWER, callback, rawUnclearCallback);
-                llmClientManager.generateUnclearIntentResponse(userMessage, history, unclearCallback);
+                llmClientManager.generateUnclearIntentResponse(userMessage, historyForAnswer, unclearCallback);
                 callback.onPhaseComplete(ChatPhaseCallback.PHASE_ANSWER);
                 if (logger.isDebugEnabled()) {
                     logger.debug("[RAG] Phase {} completed. responseLength={}, phaseElapsedTime={}ms", ChatPhaseCallback.PHASE_ANSWER,
@@ -308,7 +316,7 @@ public class ChatClient {
                     };
                     final LlmStreamCallback docNotFoundCallback =
                             new PhaseAwareStreamCallback(ChatPhaseCallback.PHASE_ANSWER, callback, rawDocNotFoundCallback);
-                    llmClientManager.generateDocumentNotFoundResponse(userMessage, documentUrl, history, docNotFoundCallback);
+                    llmClientManager.generateDocumentNotFoundResponse(userMessage, documentUrl, historyForAnswer, docNotFoundCallback);
                     callback.onPhaseComplete(ChatPhaseCallback.PHASE_ANSWER);
                     if (logger.isDebugEnabled()) {
                         logger.debug("[RAG] Phase {} completed. responseLength={}, phaseElapsedTime={}ms", ChatPhaseCallback.PHASE_ANSWER,
@@ -338,7 +346,7 @@ public class ChatClient {
                     };
                     final LlmStreamCallback summaryCallback =
                             new PhaseAwareStreamCallback(ChatPhaseCallback.PHASE_ANSWER, callback, rawSummaryCallback);
-                    llmClientManager.generateSummaryResponse(userMessage, fullDocs, history, summaryCallback);
+                    llmClientManager.generateSummaryResponse(userMessage, fullDocs, historyForAnswer, summaryCallback);
                     callback.onPhaseComplete(ChatPhaseCallback.PHASE_ANSWER);
                     if (logger.isDebugEnabled()) {
                         logger.debug("[RAG] Phase {} completed. responseLength={}, phaseElapsedTime={}ms", ChatPhaseCallback.PHASE_ANSWER,
@@ -348,6 +356,7 @@ public class ChatClient {
             } else {
                 // Phase 2: Search with query
                 final String query = StringUtil.isBlank(intentResult.getQuery()) ? userMessage : intentResult.getQuery();
+                finalSearchQuery = query;
                 phaseStartTime = System.currentTimeMillis();
                 callback.onPhaseStart(ChatPhaseCallback.PHASE_SEARCH, "Searching documents...", query);
                 ChatSearchResult querySearchResult = searchWithQueryAndMetadata(query, safeFields, safeExtraQueries);
@@ -366,13 +375,14 @@ public class ChatClient {
                 // Fallback: regenerate query if no results
                 if (searchResults.isEmpty()) {
                     logger.info("[RAG] Primary search returned 0 results, regenerating query. originalQuery={}", query);
-                    final String newQuery = llmClientManager.regenerateQuery(userMessage, query, "no_results", history);
+                    final String newQuery = llmClientManager.regenerateQuery(userMessage, query, "no_results", historyForIntent);
                     if (StringUtil.isNotBlank(newQuery) && !newQuery.equals(query)) {
                         logger.info("[RAG] Regenerated query. newQuery={}", newQuery);
                         callback.onFallback(ChatPhaseCallback.PHASE_SEARCH, "no_results", query, newQuery);
                         callback.onPhaseStart(ChatPhaseCallback.PHASE_SEARCH, "Searching with refined query...", newQuery);
                         final ChatSearchResult fallbackResult = searchWithQueryAndMetadata(newQuery, safeFields, safeExtraQueries);
                         searchResults = fallbackResult.getDocuments();
+                        finalSearchQuery = newQuery;
                         searchQueryId = fallbackResult.getQueryId();
                         searchRequestedTime = fallbackResult.getRequestedTime();
                         callback.onPhaseComplete(ChatPhaseCallback.PHASE_SEARCH, Map.of("hitCount", searchResults.size()));
@@ -389,7 +399,7 @@ public class ChatClient {
                     };
                     final LlmStreamCallback noResultsCallback =
                             new PhaseAwareStreamCallback(ChatPhaseCallback.PHASE_ANSWER, callback, rawNoResultsCallback);
-                    llmClientManager.generateNoResultsResponse(userMessage, history, noResultsCallback);
+                    llmClientManager.generateNoResultsResponse(userMessage, historyForAnswer, noResultsCallback);
                     callback.onPhaseComplete(ChatPhaseCallback.PHASE_ANSWER);
                     if (logger.isDebugEnabled()) {
                         logger.debug("[RAG] Phase {} completed. responseLength={}, phaseElapsedTime={}ms", ChatPhaseCallback.PHASE_ANSWER,
@@ -411,7 +421,8 @@ public class ChatClient {
                     // Fallback: regenerate query if no relevant results
                     if (!evalResult.isHasRelevantResults()) {
                         logger.info("[RAG] No relevant results in evaluation, regenerating query. originalQuery={}", query);
-                        final String newQuery = llmClientManager.regenerateQuery(userMessage, query, "no_relevant_results", history);
+                        final String newQuery =
+                                llmClientManager.regenerateQuery(userMessage, query, "no_relevant_results", historyForIntent);
 
                         boolean fallbackSucceeded = false;
                         if (StringUtil.isNotBlank(newQuery) && !newQuery.equals(query)) {
@@ -433,6 +444,7 @@ public class ChatClient {
                                     searchQueryId = fallbackResult.getQueryId();
                                     searchRequestedTime = fallbackResult.getRequestedTime();
                                     evalResult = fallbackEvalResult;
+                                    finalSearchQuery = newQuery;
                                     fallbackSucceeded = true;
                                 }
                             }
@@ -448,7 +460,7 @@ public class ChatClient {
                             };
                             final LlmStreamCallback fallbackNoResultsCallback =
                                     new PhaseAwareStreamCallback(ChatPhaseCallback.PHASE_ANSWER, callback, rawFallbackNoResultsCallback);
-                            llmClientManager.generateNoResultsResponse(userMessage, history, fallbackNoResultsCallback);
+                            llmClientManager.generateNoResultsResponse(userMessage, historyForAnswer, fallbackNoResultsCallback);
                             callback.onPhaseComplete(ChatPhaseCallback.PHASE_ANSWER);
                             if (logger.isDebugEnabled()) {
                                 logger.debug("[RAG] Phase {} completed. responseLength={}, phaseElapsedTime={}ms",
@@ -481,9 +493,9 @@ public class ChatClient {
                         final LlmStreamCallback answerCallback =
                                 new PhaseAwareStreamCallback(ChatPhaseCallback.PHASE_ANSWER, callback, rawAnswerCallback);
                         if (intentResult.getIntent() == ChatIntent.FAQ) {
-                            llmClientManager.generateFaqAnswerResponse(userMessage, fullDocs, history, answerCallback);
+                            llmClientManager.generateFaqAnswerResponse(userMessage, fullDocs, historyForAnswer, answerCallback);
                         } else {
-                            llmClientManager.streamGenerateAnswer(userMessage, fullDocs, history, answerCallback);
+                            llmClientManager.streamGenerateAnswer(userMessage, fullDocs, historyForAnswer, answerCallback);
                         }
                         callback.onPhaseComplete(ChatPhaseCallback.PHASE_ANSWER);
                         if (logger.isDebugEnabled()) {
@@ -512,6 +524,7 @@ public class ChatClient {
             }
             addSourcesToMessage(assistantMessage, sources, contextPath, searchQueryId, searchRequestedTime);
 
+            assistantMessage.setSearchQuery(finalSearchQuery);
             session.addMessage(assistantMessage);
 
             logger.info(
@@ -537,21 +550,43 @@ public class ChatClient {
     }
 
     /**
-     * Extracts conversation history from a chat session as LlmMessage list.
-     * The assistant message content in history is controlled by the
-     * {@code rag.chat.history.assistant.content} configuration property.
+     * Extracts conversation history shaped for the Intent Detection prompt.
+     * For {@code smart_summary} mode each assistant turn is rendered as a single
+     * {@code searched: "..." -> found: [...]} line. For other modes, this delegates
+     * to the per-message {@link #buildAssistantHistoryContent} logic.
      *
      * @param session the chat session
-     * @return the list of LlmMessages representing the conversation history
+     * @return the list of LlmMessages for Intent Detection
      */
-    protected List<LlmMessage> extractHistory(final ChatSession session) {
+    protected List<LlmMessage> extractHistoryForIntent(final ChatSession session) {
+        return extractHistoryWithMode(session, /* forIntent */ true);
+    }
+
+    /**
+     * Extracts conversation history shaped for the Answer Generation prompt.
+     * For {@code smart_summary} mode each (user, assistant) turn is rendered as a single
+     * {@code Q: "..." (searched: "...", refs: [...])} line. For other modes, this delegates
+     * to the per-message {@link #buildAssistantHistoryContent} logic.
+     *
+     * @param session the chat session
+     * @return the list of LlmMessages for Answer Generation
+     */
+    protected List<LlmMessage> extractHistoryForAnswer(final ChatSession session) {
+        return extractHistoryWithMode(session, /* forIntent */ false);
+    }
+
+    private List<LlmMessage> extractHistoryWithMode(final ChatSession session, final boolean forIntent) {
         final FessConfig fessConfig = ComponentUtil.getFessConfig();
         final String assistantContentMode = fessConfig.getOrDefault("rag.chat.history.assistant.content", "smart_summary");
 
-        final LlmClient client = llmClientManager.getClient();
+        if ("smart_summary".equals(assistantContentMode)) {
+            return extractHistorySmartSummary(session, forIntent, getHistoryTitlesMaxCount(fessConfig));
+        }
+
+        // Other modes: per-message rendering, identical for both phases.
+        final LlmClient client = llmClientManager != null ? llmClientManager.getClient() : null;
         final int assistantMaxChars = client != null ? client.getHistoryAssistantMaxChars() : 800;
         final int summaryMaxChars = client != null ? client.getHistoryAssistantSummaryMaxChars() : 800;
-
         final List<LlmMessage> history = new ArrayList<>();
         for (final ChatMessage msg : session.getMessages()) {
             if (msg.isUser()) {
@@ -564,6 +599,60 @@ public class ChatClient {
             }
         }
         return history;
+    }
+
+    private List<LlmMessage> extractHistorySmartSummary(final ChatSession session, final boolean forIntent, final int titlesMaxCount) {
+        final List<LlmMessage> history = new ArrayList<>();
+        final List<ChatMessage> messages = session.getMessages();
+        if (forIntent) {
+            // Intent phase: include only completed (user, assistant) pairs; skip trailing user without response.
+            String pendingUser = null;
+            for (final ChatMessage msg : messages) {
+                if (msg.isUser()) {
+                    pendingUser = msg.getContent();
+                } else if (msg.isAssistant()) {
+                    if (pendingUser != null) {
+                        history.add(LlmMessage.user(pendingUser));
+                        pendingUser = null;
+                    }
+                    final String line = renderIntentHistoryTurn(msg, titlesMaxCount);
+                    if (line != null) {
+                        history.add(LlmMessage.assistant(line));
+                    }
+                }
+            }
+        } else {
+            // Answer phase: pair each assistant with its preceding user, emit one rendered line per pair.
+            String pendingUser = null;
+            for (final ChatMessage msg : messages) {
+                if (msg.isUser()) {
+                    pendingUser = msg.getContent();
+                } else if (msg.isAssistant()) {
+                    if (pendingUser == null) {
+                        // Orphan assistant — skip defensively.
+                        continue;
+                    }
+                    final String line = renderAnswerHistoryTurn(pendingUser, msg, titlesMaxCount);
+                    if (line != null) {
+                        history.add(LlmMessage.assistant(line));
+                    }
+                    pendingUser = null;
+                }
+            }
+        }
+        return history;
+    }
+
+    private int getHistoryTitlesMaxCount(final FessConfig fessConfig) {
+        final String value = fessConfig.getOrDefault("rag.chat.history.titles.max.count", "5");
+        if (value == null) {
+            return 5;
+        }
+        try {
+            return Integer.parseInt(value);
+        } catch (final NumberFormatException e) {
+            return 5;
+        }
     }
 
     /**
@@ -581,7 +670,9 @@ public class ChatClient {
         case "full":
             return msg.getContent();
         case "smart_summary":
-            return buildSmartSummaryContent(msg, summaryMaxChars);
+            // smart_summary is handled by extractHistoryForIntent / extractHistoryForAnswer;
+            // it must never reach this per-message renderer.
+            throw new IllegalStateException("smart_summary mode is not handled per-message");
         case "source_titles":
             return buildSourceTitlesContent(msg, summaryMaxChars);
         case "source_titles_and_urls":
@@ -675,37 +766,6 @@ public class ChatClient {
     }
 
     /**
-     * Builds a smart summary of the assistant message for history.
-     * Preserves the beginning (direct answer) and end (conclusion) of long responses,
-     * omitting the middle section, and appends source titles.
-     *
-     * @param msg the assistant chat message
-     * @param maxChars the maximum characters for the summary
-     * @return the summarized content with source titles
-     */
-    protected String buildSmartSummaryContent(final ChatMessage msg, final int maxChars) {
-        final String content = msg.getContent();
-        if (content == null) {
-            return null;
-        }
-        final String omitMarker = "\n...[omitted]...\n";
-        final int maxSuffixLen = Math.max(0, maxChars / 4);
-        final String suffix = buildSourceTitlesSuffix(msg.getSources(), maxSuffixLen);
-        final int bodyBudget = Math.max(0, maxChars - suffix.length() - omitMarker.length());
-        if (content.length() <= bodyBudget) {
-            return content + suffix;
-        }
-        if (bodyBudget <= 0) {
-            return suffix.isEmpty() ? content.substring(0, Math.min(content.length(), maxChars)) : suffix;
-        }
-        final int headChars = (int) (bodyBudget * 0.6);
-        final int tailChars = bodyBudget - headChars;
-        final String head = content.substring(0, headChars);
-        final String tail = content.substring(content.length() - tailChars);
-        return head + omitMarker + tail + suffix;
-    }
-
-    /**
      * Builds the source titles suffix string (e.g., "\n[Referenced documents: Title1, Title2]").
      * Returns an empty string if no sources or titles are available.
      *
@@ -733,6 +793,96 @@ public class ChatClient {
             return "";
         }
         return suffix.substring(0, maxSuffixLength);
+    }
+
+    /**
+     * Renders a single assistant turn for the Intent Detection prompt history.
+     * Format: {@code searched: "<query>" -> found: [Title1, Title2, ... (+N more)]}.
+     * Returns null when there is neither a search query nor any titles.
+     *
+     * @param assistantMsg the assistant message
+     * @param titlesMaxCount the maximum number of titles to include
+     * @return the rendered line or null
+     */
+    protected String renderIntentHistoryTurn(final ChatMessage assistantMsg, final int titlesMaxCount) {
+        final String escapedQuery = escapeForLine(assistantMsg.getSearchQuery());
+        final String titles = renderTitlesList(assistantMsg.getSources(), titlesMaxCount);
+        final boolean hasQuery = StringUtil.isNotBlank(escapedQuery);
+        final boolean hasTitles = !titles.isEmpty();
+        if (!hasQuery && !hasTitles) {
+            return null;
+        }
+        final StringBuilder sb = new StringBuilder();
+        if (hasQuery) {
+            sb.append("searched: \"").append(escapedQuery).append("\"");
+        }
+        if (hasTitles) {
+            if (hasQuery) {
+                sb.append(" -> ");
+            }
+            sb.append("found: [").append(titles).append("]");
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Renders a single (user, assistant) turn for the Answer Generation prompt history.
+     * Format: {@code Q: "<userQuery>" (searched: "<query>", refs: [Title1, Title2])}.
+     *
+     * @param userQuery the user's question for that turn
+     * @param assistantMsg the assistant message
+     * @param titlesMaxCount the maximum number of titles to include
+     * @return the rendered line, or null if userQuery is blank
+     */
+    protected String renderAnswerHistoryTurn(final String userQuery, final ChatMessage assistantMsg, final int titlesMaxCount) {
+        if (StringUtil.isBlank(userQuery)) {
+            return null;
+        }
+        final String escapedUser = escapeForLine(userQuery);
+        final String escapedQuery = escapeForLine(assistantMsg.getSearchQuery());
+        final String titles = renderTitlesList(assistantMsg.getSources(), titlesMaxCount);
+        final StringBuilder sb = new StringBuilder();
+        sb.append("Q: \"").append(escapedUser).append("\"");
+        final boolean hasQuery = StringUtil.isNotBlank(escapedQuery);
+        final boolean hasTitles = !titles.isEmpty();
+        if (hasQuery || hasTitles) {
+            sb.append(" (");
+            if (hasQuery) {
+                sb.append("searched: \"").append(escapedQuery).append("\"");
+                if (hasTitles) {
+                    sb.append(", ");
+                }
+            }
+            if (hasTitles) {
+                sb.append("refs: [").append(titles).append("]");
+            }
+            sb.append(")");
+        }
+        return sb.toString();
+    }
+
+    private String renderTitlesList(final List<ChatSource> sources, final int titlesMaxCount) {
+        if (sources == null || sources.isEmpty() || titlesMaxCount <= 0) {
+            return "";
+        }
+        final List<String> titles =
+                sources.stream().map(ChatSource::getTitle).filter(t -> t != null && !t.isEmpty()).collect(Collectors.toList());
+        if (titles.isEmpty()) {
+            return "";
+        }
+        if (titles.size() <= titlesMaxCount) {
+            return String.join(", ", titles);
+        }
+        final List<String> head = titles.subList(0, titlesMaxCount);
+        final int remaining = titles.size() - titlesMaxCount;
+        return String.join(", ", head) + ", ... (+" + remaining + " more)";
+    }
+
+    private String escapeForLine(final String value) {
+        if (value == null) {
+            return null;
+        }
+        return value.replace('"', '\'').replace('\n', ' ').replace('\r', ' ');
     }
 
     private static final int MAX_QUERY_LENGTH = 1000;
